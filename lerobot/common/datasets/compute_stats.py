@@ -16,6 +16,7 @@
 import numpy as np
 
 from lerobot.common.datasets.utils import load_image_as_numpy
+from lerobot.common.datasets.video_utils import decode_video_frames
 
 
 def estimate_num_samples(
@@ -71,6 +72,47 @@ def sample_images(image_paths: list[str]) -> np.ndarray:
 
     return images
 
+def sample_frames_from_video(video_path: str) -> np.ndarray:
+    # Get video info to determine duration and frame count
+    import av
+    with av.open(video_path) as container:
+        stream = container.streams.video[0]
+        duration = float(stream.duration * stream.time_base)
+        fps = float(stream.average_rate)
+        total_frames = int(duration * fps)
+
+    # Generate timestamps for all frames in the video
+    frame_timestamps = [i / fps for i in range(total_frames)]
+    # Alternative to generate 5 timestamps for sampling
+    # frame_timestamps = [0.1 * duration, 0.3 * duration, 0.5 * duration, 0.7 * duration, 0.9 * duration]
+    
+    # Use the existing decode_video_frames function
+    frames_tensor = decode_video_frames(
+        video_path=video_path,
+        timestamps=frame_timestamps,
+        tolerance_s=0.1,  # Allow 0.1 second tolerance
+        backend="pyav",
+    )
+
+    # Convert from torch tensor to numpy array
+    # frames_tensor is in format (N, C, H, W) with values in [0, 1]
+    frames_numpy = frames_tensor.numpy()
+
+    # We load as uint8 to reduce memory usage
+    frames_numpy = (frames_numpy * 255).astype(np.uint8)
+
+    # Apply downsampling to each frame
+    sampled_frames = None
+    for i, frame in enumerate(frames_numpy):
+        frame = auto_downsample_height_width(frame)
+
+        if sampled_frames is None:
+            sampled_frames = np.empty((len(frames_numpy), *frame.shape), dtype=np.uint8)
+
+        sampled_frames[i] = frame
+
+    return sampled_frames
+
 
 def get_feature_stats(array: np.ndarray, axis: tuple, keepdims: bool) -> dict[str, np.ndarray]:
     return {
@@ -87,8 +129,12 @@ def compute_episode_stats(episode_data: dict[str, list[str] | np.ndarray], featu
     for key, data in episode_data.items():
         if features[key]["dtype"] == "string":
             continue  # HACK: we should receive np.arrays of strings
-        elif features[key]["dtype"] in ["image", "video"]:
+        elif features[key]["dtype"] == "image":
             ep_ft_array = sample_images(data)  # data is a list of image paths
+            axes_to_reduce = (0, 2, 3)  # keep channel dim
+            keepdims = True
+        elif features[key]["dtype"] == "video":
+            ep_ft_array = sample_frames_from_video(data)  # data is a single video path
             axes_to_reduce = (0, 2, 3)  # keep channel dim
             keepdims = True
         else:
