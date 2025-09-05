@@ -14,6 +14,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import contextlib
+from copy import deepcopy
 import logging
 import shutil
 from pathlib import Path
@@ -67,6 +68,7 @@ from lerobot.common.datasets.utils import (
 )
 from lerobot.common.datasets.video_utils import (
     VideoFrame,
+    VideoStreamEncoder,
     decode_video_frames,
     encode_video_frames,
     get_safe_default_codec,
@@ -476,6 +478,7 @@ class LeRobotDataset(torch.utils.data.Dataset):
         self.revision = revision if revision else CODEBASE_VERSION
         self.video_backend = video_backend if video_backend else get_safe_default_codec()
         self.delta_indices = None
+        self.video_encoders = {}
 
         # Unused attributes
         self.image_writer = None
@@ -722,7 +725,7 @@ class LeRobotDataset(torch.utils.data.Dataset):
         return self.num_frames
 
     def __getitem__(self, idx) -> dict:
-        item = self.hf_dataset[idx]
+        item = deepcopy(self.hf_dataset[idx])
         ep_idx = item["episode_index"].item()
 
         query_indices = None
@@ -819,7 +822,7 @@ class LeRobotDataset(torch.utils.data.Dataset):
                     f"An element of the frame is not in the features. '{key}' not in '{self.features.keys()}'."
                 )
 
-            if self.features[key]["dtype"] in ["image", "video"]:
+            if self.features[key]["dtype"] == "image":
                 img_path = self._get_image_file_path(
                     episode_index=self.episode_buffer["episode_index"], image_key=key, frame_index=frame_index
                 )
@@ -827,6 +830,29 @@ class LeRobotDataset(torch.utils.data.Dataset):
                     img_path.parent.mkdir(parents=True, exist_ok=True)
                 self._save_image(frame[key], img_path)
                 self.episode_buffer[key].append(str(img_path))
+            elif self.features[key]["dtype"] == "video":
+                if frame_index == 0:
+                    # Setup video encoders for a new episode. Encoders from previous episode are deleted
+                    cam_ft = self.features[key]
+
+                    video_path = self.root / self.meta.get_video_file_path(
+                        ep_index=self.episode_buffer["episode_index"], vid_key=key
+                    )
+                    if video_path.is_file():
+                        # Skip if video is already created. Could be the case when resuming data recording.
+                        logging.warning(
+                            f"Video file '{video_path}' already exists. Skipping video encoding for '{key}'."
+                        )
+                        continue
+                    self.video_encoders[key] = VideoStreamEncoder(
+                        video_path=video_path,
+                        fps=self.fps,
+                        width=cam_ft["shape"][1],
+                        height=cam_ft["shape"][0],
+                    )
+                # Add video frame to encoder
+                if key in self.video_encoders:
+                    self.video_encoders[key].add_frame(frame[key])
             else:
                 self.episode_buffer[key].append(frame[key])
 
@@ -873,13 +899,25 @@ class LeRobotDataset(torch.utils.data.Dataset):
 
         self._wait_image_writer()
         self._save_episode_table(episode_buffer, episode_index)
-        ep_stats = compute_episode_stats(episode_buffer, self.features)
 
         if len(self.meta.video_keys) > 0:
-            video_paths = self.encode_episode_videos(episode_index)
             for key in self.meta.video_keys:
-                episode_buffer[key] = video_paths[key]
+                if key in self.video_encoders:
+                    self.video_encoders[key].close()
+                    video_path = self.video_encoders[key].video_path
+                else:
+                    logging.warning(
+                        f"No video encoder found for '{key}'. This probably means that "
+                        "the video file already existed and video encoding was skipped."
+                    )
+                    # Same path as in the initialization of the video encoder
+                    video_path = self.root / self.meta.get_video_file_path(
+                        ep_index=episode_index, vid_key=key
+                    )
+                episode_buffer[key] = video_path
 
+        # episode_buffer now contains video paths instead of images paths for video keys
+        ep_stats = compute_episode_stats(episode_buffer, self.features)
         # `meta.save_episode` be executed after encoding the videos
         self.meta.save_episode(episode_index, episode_length, episode_tasks, ep_stats)
 
@@ -1015,6 +1053,7 @@ class LeRobotDataset(torch.utils.data.Dataset):
         obj.revision = None
         obj.tolerance_s = tolerance_s
         obj.image_writer = None
+        obj.video_encoders = {}
 
         if image_writer_processes or image_writer_threads:
             obj.start_image_writer(image_writer_processes, image_writer_threads)

@@ -28,6 +28,47 @@ import torchvision
 from datasets.features.features import register_feature
 from PIL import Image
 
+import fractions
+import av
+import av.video.frame
+
+
+def load_from_videos(
+    item: dict[str, torch.Tensor],
+    video_frame_keys: list[str],
+    videos_dir: Path,
+    tolerance_s: float,
+    backend: str = "pyav",
+):
+    """Note: When using data workers (e.g. DataLoader with num_workers>0), do not call this function
+    in the main process (e.g. by using a second Dataloader with num_workers=0). It will result in a Segmentation Fault.
+    This probably happens because a memory reference to the video loader is created in the main process and a
+    subprocess fails to access it.
+    """
+    # since video path already contains "videos" (e.g. videos_dir="data/videos", path="videos/episode_0.mp4")
+    data_dir = videos_dir.parent
+
+    for key in video_frame_keys:
+        if isinstance(item[key], list):
+            # load multiple frames at once (expected when delta_timestamps is not None)
+            timestamps = [frame["timestamp"] for frame in item[key]]
+            paths = [frame["path"] for frame in item[key]]
+            if len(set(paths)) > 1:
+                raise NotImplementedError("All video paths are expected to be the same for now.")
+            video_path = data_dir / paths[0]
+
+            frames = decode_video_frames_torchvision(video_path, timestamps, tolerance_s, backend)
+            item[key] = frames
+        else:
+            # load one frame
+            timestamps = [item[key]["timestamp"]]
+            video_path = data_dir / item[key]["path"]
+
+            frames = decode_video_frames_torchvision(video_path, timestamps, tolerance_s, backend)
+            item[key] = frames[0]
+
+    return item
+
 
 def get_safe_default_codec():
     if importlib.util.find_spec("torchcodec"):
@@ -131,6 +172,9 @@ def decode_video_frames_torchvision(
 
     if backend == "pyav":
         reader.container.close()
+
+        for stream in reader.container.streams:
+            stream.close()
 
     reader = None
 
@@ -241,7 +285,7 @@ def decode_video_frames_torchcodec(
     assert len(timestamps) == len(closest_frames)
     return closest_frames
 
-
+# deprecated, use VideoStreamEncoder class instead
 def encode_video_frames(
     imgs_dir: Path | str,
     video_path: Path | str,
@@ -328,6 +372,52 @@ def encode_video_frames(
 
     if not video_path.exists():
         raise OSError(f"Video encoding did not work. File not found: {video_path}.")
+    
+
+class VideoStreamEncoder:
+    """
+    Encodes a video stream from individual frames and writes it to a video file.
+
+    This class provides a simple interface to create a video file by sequentially adding frames (as
+    numpy arrays) and finalizing the file upon completion. It uses PyAV for video encoding.
+
+    Args:
+        video_path (str or Path): Path to the output video file.
+        fps (int): Frames per second for the output video.
+        width (int): Width of the video frames.
+        height (int): Height of the video frames.
+        vcodec (str, optional): Video codec to use (default: "libsvtav1").
+        pix_fmt (str, optional): Pixel format (default: "yuv420p").
+
+    Methods:
+        add_frame(image): Adds a single frame to the video.
+        close(): Finalizes and closes the video file.
+    """
+    def __init__(self, video_path, fps, width, height, vcodec="libsvtav1", pix_fmt="yuv420p"):
+        logging.getLogger("libav").setLevel(av.logging.ERROR)
+        self.video_path = video_path
+        video_path.parent.mkdir(parents=True, exist_ok=True)
+        self.container = av.open(str(self.video_path), mode="w")
+        self.stream = self.container.add_stream(vcodec, rate=fps)
+        self.stream.width = width
+        self.stream.height = height
+        self.stream.pix_fmt = pix_fmt
+        self.fps = fps
+        self.timestamp = 0
+        self.clock_rate = 90000
+
+    def add_frame(self, image):
+        frame = av.VideoFrame.from_ndarray(image, format="rgb24")
+        frame.pts = self.timestamp
+        frame.time_base = fractions.Fraction(1, self.clock_rate)
+        self.timestamp += int((1 / self.fps) * self.clock_rate)
+        for packet in self.stream.encode(frame):
+            self.container.mux(packet)
+
+    def close(self):
+        for packet in self.stream.encode(None):
+            self.container.mux(packet)
+        self.container.close()
 
 
 @dataclass
